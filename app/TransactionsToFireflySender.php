@@ -110,7 +110,13 @@ class TransactionsToFireflySender
         // Get currency code from structured description (set by CAMT parser)
         $structuredDesc = $transaction->getStructuredDescription();
         $currencyCode = $structuredDesc['CURR'] ?? null;
-
+        
+        // KREF (Kundenreferenz) -> external_id.
+        // Leerstring und Überlänge würden Fireflys Validierung (min:1, max:255)
+        // verletzen und die GESAMTE Transaktion mit HTTP 422 scheitern lassen.
+        $kref = trim((string) ($structuredDesc['KREF'] ?? ''));
+        $kref = $kref === '' ? null : mb_substr($kref, 0, 255);
+        
         // Build transaction array and filter out null values
         $transactionData = array_filter([
             'type' => $type,
@@ -125,6 +131,7 @@ class TransactionsToFireflySender
             'destination_id' => $destination['id'] ?? null,
             'destination_iban' => $destination['iban'] ?? null,
             'sepa_ct_id' => $transaction->getEndToEndID() ?: null,
+            'external_id' => $kref,
             'notes' => $structuredDesc['ABWA'] ?? $destination['name'] ?? null,
         ], fn($value) => $value !== null);
 
