@@ -85,46 +85,92 @@ class StatementOfAccountHelper
                         $relatedParty = null;
                         $relatedParties = $detail->getRelatedParties();
 
-                        if (count($relatedParties) > 1) {
-                            // Multiple parties - select based on transaction direction
-                            foreach ($relatedParties as $party) {
-                                $partyType = $party->getRelatedPartyType();
-                                if ($cdIndicator === 'CRDT' && $partyType instanceof \Genkgo\Camt\DTO\Debtor) {
-                                    // For credits, use the Debtor (sender)
-                                    $relatedParty = $party;
-                                    break;
-                                } elseif ($cdIndicator === 'DBIT' && $partyType instanceof \Genkgo\Camt\DTO\Creditor) {
-                                    // For debits, use the Creditor (recipient)
-                                    $relatedParty = $party;
-                                    break;
+                        $mainParty    = null;   // Creditor / Debtor - carries the IBAN
+                        $ultimateName = '';     // UltimateCreditor / UltimateDebtor
+
+                        foreach ($relatedParties as $party) {
+                            $partyType = $party->getRelatedPartyType();
+
+                            if ($cdIndicator === 'DBIT') {
+                                if ($partyType instanceof \Genkgo\Camt\DTO\Creditor && !$mainParty) {
+                                    $mainParty = $party;
+                                } elseif ($partyType instanceof \Genkgo\Camt\DTO\UltimateCreditor) {
+                                    $ultimateName = (string) $partyType->getName();
+                                }
+                            } else {
+                                if ($partyType instanceof \Genkgo\Camt\DTO\Debtor && !$mainParty) {
+                                    $mainParty = $party;
+                                } elseif ($partyType instanceof \Genkgo\Camt\DTO\UltimateDebtor) {
+                                    $ultimateName = (string) $partyType->getName();
                                 }
                             }
                         }
 
+                        $relatedParty = $mainParty;
                         // Fallback to first party if no specific match found
                         if (!$relatedParty && !empty($relatedParties)) {
                             $relatedParty = $relatedParties[0];
                         }
 
-                        // Set counterparty account number (IBAN)
-                        if ($relatedParty && $relatedParty->getAccount()) {
+                        $mainName = '';
+                        if ($relatedParty && $relatedParty->getRelatedPartyType()) {
+                            $mainName = (string) $relatedParty->getRelatedPartyType()->getName();
+                        }
+
+                        // UltimateCreditor arrives as "Name/Street/City/Country" -
+                        // only the leading name part is useful.
+                        $ultimateClean = $ultimateName !== ''
+                            ? trim(explode('/', $ultimateName)[0])
+                            : '';
+
+                        // Compare the first word, with umlauts roughly normalised.
+                        $firstToken = static function (string $s): string {
+                            $s = strtr($s, [
+                                'Ä' => 'A', 'Ö' => 'O', 'Ü' => 'U',
+                                'ä' => 'A', 'ö' => 'O', 'ü' => 'U', 'ß' => 'S',
+                            ]);
+                            $s = strtoupper($s);
+                            return preg_match('/[A-Z0-9]+/', $s, $m) ? $m[0] : '';
+                        };
+
+                        $counterName = $mainName;
+                        $keepIban    = true;
+
+                        if ($ultimateClean !== '') {
+                            if ($mainName === '') {
+                                // Only an ultimate party is known.
+                                $counterName = $ultimateClean;
+                                $keepIban    = false;
+                            } elseif ($firstToken($mainName) !== $firstToken($ultimateClean)) {
+                                // Different companies -> the main party is just the
+                                // processor. Use the merchant and DROP the IBAN, because
+                                // Firefly resolves the account by IBAN before name and
+                                // would otherwise keep using the processor's account.
+                                $counterName = $ultimateClean;
+                                $keepIban    = false;
+                            }
+                            // Same first word -> same company; keep the shorter, more
+                            // stable main name (no address suffix, no branch number).
+                        }
+
+                        Logger::trace(sprintf(
+                            'Counterparty: main="%s", ultimate="%s" -> using "%s" (IBAN %s)',
+                            $mainName,
+                            $ultimateClean,
+                            $counterName,
+                            $keepIban ? 'kept' : 'dropped'
+                        ));
+
+                        // Set counterparty account number (IBAN), but only when it
+                        // belongs to the name we actually chose.
+                        if ($keepIban && $relatedParty && $relatedParty->getAccount()) {
                             $transaction->setAccountNumber($relatedParty->getAccount()->getIdentification());
                         } else {
                             $transaction->setAccountNumber("");
                         }
 
                         // Set counterparty name
-                        if ($relatedParty && $relatedParty->getRelatedPartyType()) {
-                            $partyType = $relatedParty->getRelatedPartyType();
-                            $name = $partyType->getName();
-                            if ($name) {
-                                $transaction->setName($name);
-                            } else {
-                                $transaction->setName("");
-                            }
-                        } else {
-                            $transaction->setName("");
-                        }
+                        $transaction->setName($counterName);
 
                         // Handle single-party transactions where bank only provides one party (yourself)
                         // In these cases, keep the IBAN as-is - transfer detection will handle it
